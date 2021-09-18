@@ -1,0 +1,475 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+
+
+
+
+```{r,warnng=FALSE,message=FALSE}
+setwd("C:/Users/Cayoyo/Desktop/R")
+
+library(tidyverse)
+library(haven)
+
+Casen2020 <- read_dta("Casen en Pandemia 2020 STATA.dta")
+
+Casen2020 <- Casen2020 %>% mutate_if(is.labelled,funs(as_factor(.)))
+```
+
+
+#filtar por edad, mayores de edad sacar todo los que comienze con y 
+
+```{r}
+Casen2020.1<-Casen2020 %>% filter(edad>=18&is.na(pobreza)==FALSE&pco1=="Jefe(a) de Hogar")%>% 
+  select(!c(starts_with("y"), qaut,qautr,pobreza_sinte,folio,o,id_persona,id_vivienda,
+            expr,expp,expc,fecha_entrev,metodologia_entrev,informante_idoneo,tel1,dautr,dau,
+            dautr,qautr,dau,qaut,cod_upm,varunit,varstrat,segmento,estrato,hogar,li,lp,yae,yae_sinte,
+            pobreza_sinte,nae)) %>% 
+      select_if(~sum(!is.na(.)) > 31455  & (nlevels(.)<30) & is.character(.)==FALSE) %>% 
+  mutate(v27 = na_if(v27, "no sabe")) %>% mutate(v27=as.numeric(v27)) %>% 
+  mutate(pobreza=ifelse(pobreza=="No pobres","0","1"))
+
+```
+
+
+
+
+```{r}
+library(tidymodels)
+library(finetune)
+
+set.seed(2021)
+spl <- initial_split(Casen2020.1,strata=pobreza)
+train <- training(spl)
+test <- testing(spl)
+
+
+train_5fold <- train %>%
+  vfold_cv(5)
+
+mset <- metric_set(roc_auc)
+
+grid_control <- control_race(save_pred = TRUE,
+                             save_workflow = TRUE,
+                             extract = extract_model,
+                             verbose_elim = TRUE)
+```
+
+
+```{r}
+xg_rec <- recipe(pobreza ~.,data = train) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors())%>%
+  step_impute_linear(v19,
+                     impute_with = imp_vars(region,v27,s13,educ))%>% 
+  step_log(all_numeric(), offset = 1) %>%
+  step_normalize(all_numeric()) %>% 
+  step_dummy(all_nominal_predictors(),-all_outcomes(),one_hot=TRUE) 
+  
+
+xg_mod <- boost_tree("classification",
+                     mtry = tune(),
+                     trees = 1000,
+                     learn_rate = tune(),
+                     tree_depth = tune(),
+                     min_n = tune(),
+                     loss_reduction = tune(),
+                     sample_size = tune(),
+                     ) %>%
+                   set_engine("xgboost")
+
+
+xg_wf <- workflow() %>%
+  add_recipe(xg_rec) %>%
+  add_model(xg_mod)
+
+```
+
+
+```{r}
+
+doParallel::registerDoParallel()
+
+set.seed(1235)
+
+
+xg_tune <- tune_race_anova(
+  xg_wf,
+  resamples = train_5fold,
+  metrics = mset,
+  control = grid_control,
+  grid = grid_latin_hypercube(tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(),train),
+  learn_rate(),
+  size = 30))
+
+
+```
+
+
+
+```{r}
+  autoplot(xg_tune)
+
+  xg_tune %>%
+  collect_metrics() %>%
+  arrange(mean)
+```
+
+```{r,warning=FALSE}
+xg_tune %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "roc_auc")
+```
+
+
+
+
+```{r}
+  xg_tune %>%
+    collect_metrics() %>%  arrange(mean)
+  
+  best_log.loss <- select_best(xg_tune, "roc_auc")
+  best_log.loss
+  
+  
+  final_xgb <- finalize_workflow(
+    xg_wf,
+    best_log.loss
+  )
+  
+  final_xgb
+```
+
+
+
+
+```{r}
+ library(vip)
+  
+  final_xgb %>%
+    fit(data = train) %>%
+    pull_workflow_fit() %>%
+    vip(geom = "point", num_features = 20)  
+  
+final_res <- last_fit(final_xgb, spl)
+  
+collect_metrics(final_res) 
+```
+0.91
+0.89
+
+
+```{r}
+xg_conf <- final_res %>%
+  unnest(.predictions) %>%
+  conf_mat(pobreza, .pred_class)
+
+xg_conf
+
+
+```
+
+##Ahora un Knn
+
+```{r}
+collect_predictions(final_res) %>%
+  conf_mat(pobreza, .pred_class) %>%
+  autoplot()
+```
+
+
+
+
+```{r}
+
+
+```
+
+
+
+```{r}
+
+control <- control_grid(save_pred = TRUE,
+                        save_workflow = TRUE)
+
+
+```
+
+
+
+```{r}
+
+lr_mod <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet")
+
+
+
+lr_recipe <- recipe(pobreza ~.,data = train) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors())%>%
+  step_log(all_numeric(), offset = 1) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
+
+
+lr_workflow <- 
+  workflow() %>% 
+  add_model(lr_mod) %>% 
+  add_recipe(lr_recipe)
+
+```
+
+
+```{r}
+lr_reg_grid <- tibble(penalty = 10^seq(-4, -1, length.out = 30))
+
+lr_reg_grid %>% top_n(-5)
+
+lr_reg_grid %>% top_n(5) 
+
+```
+
+```{r}
+lr_res <- 
+  lr_workflow %>% 
+  tune_grid(train_5fold,
+            grid = lr_reg_grid,
+            control = control_grid(save_pred = TRUE,save_workflow = TRUE),
+            metrics = metric_set(roc_auc))
+```
+
+```{r}
+lr_plot <- 
+  lr_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = penalty, y = mean)) + 
+  geom_point() + 
+  geom_line() + 
+  ylab("Area under the ROC Curve") +
+  scale_x_log10(labels = scales::label_number())
+
+lr_plot
+
+```
+
+
+
+                 
+```{r}
+top_models <-
+  lr_res %>% 
+  show_best("roc_auc", n = 15) %>% 
+  arrange(penalty) 
+
+top_models
+```
+                 
+                 
+                 
+                  
+
+```{r}
+best_roc <- select_best(lr_res, "roc_auc")
+best_roc
+```
+
+
+
+
+```{r}
+final_lr <- finalize_workflow(
+  lr_workflow,
+  best_roc
+)
+
+final_lr
+```
+
+
+```{r}
+library(vip)
+
+final_lr %>%
+  fit(data = train) %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+```
+
+
+
+
+
+
+```{r}
+final_res.ln <- last_fit(final_lr, spl)
+
+collect_metrics(final_res.ln)
+```
+
+
+
+```{r}
+lin_conf <- final_res.ln %>%
+  unnest(.predictions) %>%
+  conf_mat(pobreza, .pred_class)
+
+lin_conf
+```
+
+
+
+```{r}
+xg_conf
+```
+
+Xgboost es mejor le achunta mas a los que son pobres y crea menos falsos positivos
+
+
+
+##Knn
+
+
+
+
+```{r}
+
+knn_mod <- 
+  nearest_neighbor(neighbors = tune()) %>% 
+  set_engine("kknn")%>% 
+  set_mode("classification")
+
+knn_recipe <- recipe(pobreza ~.,data = train) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors())%>%
+  step_log(all_numeric(), offset = 1) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
+
+
+knn_workflow <- 
+  workflow() %>% 
+  add_model(knn_mod) %>% 
+  add_recipe(knn_recipe)
+
+```
+
+
+```{r}
+knn_param <- 
+  knn_workflow %>% 
+  parameters() %>% 
+    update(
+    neighbors = neighbors(c(2,1000)))
+```
+
+
+```{r}
+
+doParallel::registerDoParallel()
+
+set.seed(1235)
+
+
+set.seed(8154)
+knn_search <- tune_grid(knn_workflow, resamples = train_5fold,
+                         param_info = knn_param, 
+                         control = control_grid(save_pred = TRUE,save_workflow = TRUE),
+                         metrics = metric_set(roc_auc))
+
+```
+
+mset
+
+
+
+```{r}
+ knn_search %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = neighbors, y = mean)) + 
+  geom_point() + 
+  geom_line() + 
+  ylab("Area under the ROC Curve") +
+  scale_x_log10(labels = scales::label_number())
+```
+
+```{r}
+ knn_search %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = neighbors, y = mean)) + 
+  geom_point() + 
+  geom_line() + 
+  ylab("Area under the ROC Curve") +
+  scale_x_log10(labels = scales::label_number()) 
+```
+
+
+```{r}
+best_knn<- select_best(knn_search, "roc_auc")
+best_knn
+```
+
+
+
+```{r}
+final_knn <- finalize_workflow(
+  knn_workflow,
+  best_knn
+)
+
+final_knn
+```
+
+
+
+
+```{r}
+  knn_search %>% 
+  show_best("roc_auc", n = 15) %>% 
+  arrange(neighbors) 
+
+```
+
+```{r}
+
+final_knn %>%
+  fit(data = train) %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "point")
+```
+
+
+
+
+```{r}
+final_res.knn <- last_fit(final_knn, spl)
+
+collect_metrics(final_res.knn)
+```
+
+
+
+
+
+
+
+
